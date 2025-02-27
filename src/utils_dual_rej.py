@@ -29,7 +29,7 @@ from transformers.utils import (
 ModelOutput,
 is_accelerate_available,
 is_hqq_available,
-# is_quanto_available,
+is_quanto_available,
 is_torchdynamo_compiling,
 logging,
 )
@@ -760,7 +760,7 @@ def _assisted_decoding(
         `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
         `model.config.is_encoder_decoder=True`.
     """
-    print("***********Using Custom assistant decoding**********")
+    print("***********Using Cuton assistant decoding**********")
     # init values
     do_sample = generation_config.do_sample
     output_attentions = generation_config.output_attentions
@@ -1038,6 +1038,9 @@ def _speculative_sampling(
     q_i = q[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
     p = new_logits.softmax(dim=-1)
     p_i = p[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
+    
+    # adjust_p = new_logits - 
+    
     probability_ratio = p_i / q_i
     # probability_ratio = torch.exp(p_i - q_i)
     # assert not torch.isnan(probability_ratio).any(), "NaN values in probabilities"
@@ -1128,8 +1131,8 @@ def _speculative_sampling(
         p_n_plus_1 = p[:, n_matches, :]
         if n_matches < gamma:
             q_n_plus_1 = q[:, n_matches, :]
-            # p_prime = torch.clamp((p_n_plus_1 - q_n_plus_1), min=0)
-            p_prime = torch.clamp((p_n_plus_1 - q_n_plus_1), min=0) * torch.clamp((1 - m * q_n_plus_1 / p_n_plus_1), min=0)
+            p_prime = torch.clamp((p_n_plus_1 - q_n_plus_1), min=0)
+            # p_prime = torch.clamp((p_n_plus_1 - q_n_plus_1), min=0) - torch.clamp(m * q_n_plus_1 / p_n_plus_1 * (q_n_plus_1 - p_n_plus_1), min=0)
             # print("p zero", torch.eq(p_n_plus_1, 0).any().item())
             # print("q zero", torch.eq(q_n_plus_1, 0).any().item())
             # print("p:", p_n_plus_1)

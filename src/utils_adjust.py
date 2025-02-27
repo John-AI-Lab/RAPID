@@ -29,7 +29,7 @@ from transformers.utils import (
 ModelOutput,
 is_accelerate_available,
 is_hqq_available,
-# is_quanto_available,
+is_quanto_available,
 is_torchdynamo_compiling,
 logging,
 )
@@ -270,6 +270,7 @@ def generate(
     assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
     assistant_input_ids = kwargs.pop("assistant_input_ids", None)  # only used for assisted generation
     speculative_margin = kwargs.pop("speculative_margin", 1)
+    spec_alpha = kwargs.pop("spec_alpha", 0.1)
     assistant_past_key_values = kwargs.pop("assistant_past_key_values", None)
     output_latency = kwargs.pop("output_latency", False)
 
@@ -476,6 +477,7 @@ def generate(
             synced_gpus=synced_gpus,
             streamer=streamer,
             speculative_margin=speculative_margin,
+            spec_alpha=spec_alpha,
             assistant_past_key_values=assistant_past_key_values,
             **model_kwargs,
         )
@@ -719,6 +721,7 @@ def _assisted_decoding(
     generation_config: GenerationConfig,
     synced_gpus: bool,
     speculative_margin: float,
+    spec_alpha: float,
     assistant_past_key_values: Optional[Dict[str, torch.Tensor]],
     streamer: Optional["BaseStreamer"],
     **model_kwargs,
@@ -760,7 +763,7 @@ def _assisted_decoding(
         `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
         `model.config.is_encoder_decoder=True`.
     """
-    print("***********Using Custom assistant decoding**********")
+    print("***********Using Cuton assistant decoding**********")
     # init values
     do_sample = generation_config.do_sample
     output_attentions = generation_config.output_attentions
@@ -867,15 +870,16 @@ def _assisted_decoding(
         new_logits = outputs.logits[:, -candidate_length - 1 :].float()  # excludes the input prompt if present
         new_logits = new_logits.to(input_ids.device)
         next_token_logits = new_logits.clone()
-        # if len(logits_processor) > 0:
-        #     for i in range(candidate_length + 1):
-        #         new_logits[:, i, :] = logits_processor(candidate_input_ids[:, : cur_len + i], new_logits[:, i, :])
+        if len(logits_processor) > 0:
+            for i in range(candidate_length + 1):
+                new_logits[:, i, :] = logits_processor(candidate_input_ids[:, : cur_len + i], new_logits[:, i, :])
 
         # 3. Select the accepted tokens. There are two possible cases:
         # Case 1: `do_sample=True` and we have logits for the candidates (originally from speculative decoding)
         # 👉 Apply algorithm 1 from the speculative decoding paper (https://arxiv.org/pdf/2211.17192.pdf).
         if candidate_logits is not None: 
             print("Start Speculative Sampling")
+            # temperature = generation_config.get("temperature", 1)
             valid_tokens, n_matches = _speculative_sampling(
                 candidate_input_ids,
                 candidate_logits,
@@ -883,6 +887,8 @@ def _assisted_decoding(
                 new_logits,
                 is_done_candidate,
                 m=speculative_margin,
+                alpha=spec_alpha,
+                # temperature=generation_config.temperature
             )
         # Case 2: all other cases (originally from assisted generation) 👉 Compare the tokens selected from the
         # original model logits with the candidate tokens. We can keep the candidate tokens until the first
@@ -1011,20 +1017,25 @@ def _assisted_decoding(
             )
     else:
         decoding_end_time = time.time()
-        {
+        return_dict = {
             "accept_tokens": accepted_tokens,
             "decoding_time": decoding_end_time - decoding_start_time,
             "candidates_tokens": candidates_tokens
         }
         return input_ids, return_dict
 
+
+
 def _speculative_sampling(
-    candidate_input_ids,
-    candidate_logits,
-    candidate_length,
-    new_logits,
-    is_done_candidate,
-):
+        candidate_input_ids,
+        candidate_logits,
+        candidate_length,
+        new_logits,
+        is_done_candidate,
+        m=0,
+        alpha=0.1,
+        # temperature=1
+    ):
     """
     Applies sampling as in the speculative decoding paper (https://arxiv.org/pdf/2211.17192.pdf, algorithm 1). Returns
     the selected tokens, as well as the number of candidate matches.
@@ -1038,14 +1049,128 @@ def _speculative_sampling(
     q_i = q[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
     p = new_logits.softmax(dim=-1)
     p_i = p[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
-    probability_ratio = p_i / q_i
+    
+    # adjust_logits = new_logits[:, torch.arange(candidate_length), :] - m * new_logits[:, torch.arange(candidate_length), :] + m * candidate_logits[:, torch.arange(candidate_length), :]
+    # adjust_p = adjust_logits.softmax(dim=-1)
+    # adjust_p_i = adjust_p[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
+    
+    # imp cd
+    # expert_logits = candidate_logits[:, torch.arange(candidate_length), :]
+    student_logits = new_logits[:, torch.arange(candidate_length), :]
+    teacher_logits = candidate_logits[:, torch.arange(candidate_length), :]
+    teacher_prob = (teacher_logits).softmax(dim=-1)
+    student_prob = (student_logits).softmax(dim=-1)
+    gradient = student_prob - teacher_prob
+    # print("Sum of logits,", student_logits.sum())
 
-    # When probability_ratio > 1 (i.e. q_i(x) < p_i(x), or "assistant probability of the candidate token is smaller
-    # than the model probability for the same token"), keep the token. Otherwise reject with p = 1 - probability_ratio
-    # (= keep with p = probability_ratio). Keep all the tokens until the first rejection
+    threshold = alpha * teacher_prob.max(dim=-1, keepdim=True)[0]
+    mask = teacher_prob >= threshold
+
+    truncate_g = torch.where(mask, gradient, torch.full_like(gradient, 0.0))
+    
+
+
+    adjust_logits = student_logits - m * truncate_g
+
+    # threshold = expert_logits.max(dim=-1, keepdim=True)[0] + np.log(alpha)
+    # mask = expert_logits >= threshold
+    # contrastive_diff = m * (expert_logits - amateur_logits)
+    # contrastive_logits = torch.where(mask, contrastive_diff, torch.full_like(contrastive_diff, 0.0))
+    
+    # adjust_logits = new_logits[:, torch.arange(candidate_length), :] + contrastive_logits
+    adjust_p = adjust_logits.softmax(dim=-1)
+    adjust_p_i = adjust_p[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
+    
+    # naive cd
+
+    # threshold = 0.1 * q.max(dim=-1, keepdim=True)[0]
+    # mask = q >= threshold
+    # contrastive_diff = m * (q.log() - p.log())
+    # contrastive_logits = torch.where(mask, contrastive_diff, torch.full_like(contrastive_diff, 0.0))
+    
+    # adjust_p = adjust_logits.softmax(dim=-1)
+    # adjust_p_i = adjust_p[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
+    
+
+
+    probability_ratio = adjust_p_i / q_i
+    # probability_ratio = torch.exp(p_i - q_i)
+    # assert not torch.isnan(probability_ratio).any(), "NaN values in probabilities"
+    # assert not torch.isinf(probability_ratio).any(), "Infinite values in probabilities"
+    # assert not torch.isinf(-probability_ratio).any(), "Infinite values in probabilities"
+    # print(probability_ratio)
+    print("M=", m)
+    print("Alpha=", alpha)
+    # probability_ratio = probability_ratio + (1 - probability_ratio) * m * q_i / p_i
+    # # When probability_ratio > 1 (i.e. q_i(x) < p_i(x), or "assistant probability of the candidate token is smaller
+    # # than the model probability for the same token"), keep the token. Otherwise reject with p = 1 - probability_ratio
+    # # (= keep with p = probability_ratio). Keep all the tokens until the first rejection
     r_i = torch.rand_like(probability_ratio)
-    is_accepted = r_i <= probability_ratio
+    is_accepted = r_i <= probability_ratio 
+    # is_accepted_lc = r_i <= probability_ratio 
+    # n_matches_naive = ((~is_accepted).cumsum(dim=-1) < 1).sum()  # this is `n` in algorithm 1
+    
+    
+    # rag_probability_ratio = m * q_i / p_i
+    # r_i_rag = torch.rand_like(rag_probability_ratio)
+    # is_accepted_rag = r_i_rag <= rag_probability_ratio
+    # is_accepted = torch.logical_or(is_accepted_lc, is_accepted_rag)
+    
+
+
+    # log_q_i = q_i.log()
+    # log_p_i = p_i.log()
+    
+    # for i in range(candidate_length)
+    
+    
+    
+    # span_size = 4
+    # num_complete_spans = candidate_length // span_size
+    # n_matches = 0
+
+    # for span_idx in range(num_complete_spans):
+    #     start = span_idx * span_size
+    #     end = start + span_size
+    #     q_i_span = q_i[start:end].prod(dim=-1)
+    #     p_i_span = p_i[start:end].prod(dim=-1)
+    #     span_probability_ratio = p_i_span / (m * q_i_span)  # Product over the spans
+        
+    #     r_i_span = torch.rand_like(span_probability_ratio)
+    #     if r_i_span <= span_probability_ratio:
+    #         n_matches += q_i[start:end].size(0)
+    #     else:
+    #         break  # Stop at the first rejection span
+    # # print(n_matches)
+    # is_accepted[:n_matches] = True
     n_matches = ((~is_accepted).cumsum(dim=-1) < 1).sum()  # this is `n` in algorithm 1
+    
+    # def update_spans(is_accepted, span_size):
+    #     is_accepted = is_accepted.clone()  # Clone to avoid modifying the original tensor
+    #     for i in range(0, is_accepted.size(0), span_size):
+    #         span = is_accepted[i:i + span_size]
+    #         if span.sum().item() > 2:  # Count of True (as True is 1 and False is 0)
+    #             is_accepted[i:i + span_size] = torch.ones_like(span, dtype=bool)
+    #     return is_accepted
+
+    # span_size = 4
+    # is_accepted = update_spans(is_accepted, span_size)
+    
+    # print(is_accepted)
+    # n_matches = ((~is_accepted).cumsum(dim=-1) < 1).sum()  # this is `n` in algorithm 1
+
+    # print(updated_matches)
+    # Output: [True, True, True, True, False, True, False, False]
+
+    # real_n_matches = ((~is_accepted).cumsum(dim=-1) < 1).sum()  # this is `n` in algorithm 1
+    # tolerance_tokens = candidate_length//4
+    # is_accepted[:tolerance_tokens] = True  # always accept the first tokens
+    # tol_n_matches = ((~is_accepted).cumsum(dim=-1) < 1).sum()
+    
+    # if tol_n_matches >= 3*candidate_length // 4:
+    #     n_matches = tol_n_matches
+    # else:
+    #     n_matches = real_n_matches
 
     # Ensure we don't generate beyond max_len or an EOS token (not in algorithm 1, but needed for correct behavior)
     if is_done_candidate and n_matches == candidate_length:
@@ -1058,11 +1183,22 @@ def _speculative_sampling(
         gamma = candidate_logits.shape[1]
         p_n_plus_1 = p[:, n_matches, :]
         if n_matches < gamma:
+            adjust_p_n_plus_1 = adjust_p[:, n_matches, :]
             q_n_plus_1 = q[:, n_matches, :]
-            p_prime = torch.clamp((p_n_plus_1 - q_n_plus_1), min=0)
+            # p_prime = torch.clamp((adjust_p_n_plus_1 - q_n_plus_1), min=0)
+            p_prime = torch.clamp(torch.maximum(p_n_plus_1 - q_n_plus_1, p_n_plus_1 - adjust_p_n_plus_1), min=0)
+            # p_prime = torch.clamp((p_n_plus_1 - q_n_plus_1), min=0) - torch.clamp(m * q_n_plus_1 / p_n_plus_1 * (q_n_plus_1 - p_n_plus_1), min=0)
+            # print("p zero", torch.eq(p_n_plus_1, 0).any().item())
+            # print("q zero", torch.eq(q_n_plus_1, 0).any().item())
+            # print("p:", p_n_plus_1)
+            # print("q:", q_n_plus_1)
+            print("q_item", p_prime)
             p_prime.div_(p_prime.sum())
         else:
             p_prime = p_n_plus_1
+            # p_prime = p[:, n_matches, :]
+            # p_prime
+        # print(p_prime)
         t = torch.multinomial(p_prime, num_samples=1).squeeze(1)[None, :]
 
         # The selected tokens include the matches (if any) plus the next sampled tokens

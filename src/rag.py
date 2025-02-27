@@ -163,17 +163,17 @@ def get_rag_context(long_context, query, embed_model_path, tokenizer, num_to_ret
     chunks = split_into_chunks(long_context, tokenizer, max_tokens=max_chunk_token)
     embed_model = SentenceTransformer(embed_model_path)
     model_retrieved_chunks = retrieve_short_context(embed_model, tokenizer, chunks, query, top_k=num_to_retrieve, rag_threshold=rag_threshold)
-    bm25_retrieval_chunks = retrieve_short_context_bm25(tokenizer, chunks, query, top_k=5)
-    print("bm25_retrieval_chunks: ", len(bm25_retrieval_chunks))
-    all_chunks = model_retrieved_chunks + bm25_retrieval_chunks
+    # bm25_retrieval_chunks = retrieve_short_context_bm25(tokenizer, chunks, query, top_k=5)
+    # print("bm25_retrieval_chunks: ", len(bm25_retrieval_chunks))
+    all_chunks = model_retrieved_chunks
     unique_chunks = {chunk['position']: chunk for chunk in all_chunks}.values()
     
     # Sort by original position
     sorted_chunks = sorted(unique_chunks, key=lambda x: x['position'])
     
     # Join the sorted chunks
-    retrieved_context = ' '.join(chunk['text'] for chunk in sorted_chunks)
-    return retrieved_context
+    retrieved_context = '\n\n'.join(chunk['text'] for chunk in sorted_chunks)
+    return retrieved_context, len(sorted_chunks)
 
 
 

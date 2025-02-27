@@ -269,8 +269,12 @@ class LongAssistedCandidateGenerator(CandidateGenerator):
         # Prepare the assistant and the starting number of candidate tokens
         # Use 'heuristic' or 'constant' or 'dynamic'
         assistant_model.generation_config.num_assistant_tokens_schedule='constant'
-        assistant_model.generation_config.assistant_confidence_threshold=0.1
-        assistant_model.generation_config.num_assistant_tokens=10
+        assistant_model.generation_config.assistant_confidence_threshold=generation_config.assistant_confidence_threshold
+        assistant_model.generation_config.num_assistant_tokens=generation_config.num_assistant_tokens
+        print(f"Schedule: {assistant_model.generation_config.num_assistant_tokens_schedule}")
+        print(f"Threshold: {assistant_model.generation_config.assistant_confidence_threshold}")
+        # print(assistant_model.generation_config)
+        # print(generation_config.top_p)
         # assistant_model.generation_config.assistant_confidence_threshold=0.4
 
         # confidence threshold
