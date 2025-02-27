@@ -1,4 +1,4 @@
-from .utils_adjust import generate, _get_candidate_generator, _assisted_decoding
+from .utils import generate, _get_candidate_generator, _assisted_decoding
 import transformers
 
 

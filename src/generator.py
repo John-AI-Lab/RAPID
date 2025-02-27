@@ -224,7 +224,7 @@ class AssistedCandidateGenerator(CandidateGenerator):
 
 
 
-class LongAssistedCandidateGenerator(CandidateGenerator):
+class RAPIDAssistedCandidateGenerator(CandidateGenerator):
     """
     `CandidateGenerator` class to be used for assisted generation and speculative decoding. This class generates
     candidates through the use of a smaller model. Read the following blog post for more information:

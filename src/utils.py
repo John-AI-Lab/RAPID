@@ -108,7 +108,7 @@ logger = logging.get_logger(__name__)
 if is_accelerate_available():
     from accelerate.hooks import AlignDevicesHook, add_hook_to_module
 
-from .generator import LongAssistedCandidateGenerator
+from .generator import RAPIDAssistedCandidateGenerator
 from transformers.generation import GenerationMixin
 
 
@@ -139,7 +139,7 @@ def _get_candidate_generator(
             max_length=generation_config.max_length,
         )
     elif assistant_input_ids is not None:
-        candidate_generator = LongAssistedCandidateGenerator(
+        candidate_generator = RAPIDAssistedCandidateGenerator(
             input_ids=input_ids,
             assistant_input_ids=assistant_input_ids,
             assistant_model=assistant_model,
@@ -263,13 +263,17 @@ def generate(
                 - [`~generation.GenerateEncoderDecoderOutput`],
                 - [`~generation.GenerateBeamEncoderDecoderOutput`]
     """
-    print("****************Using long speculative decoding**************")
+    # print("****************Using new long speculative decoding**************")
     # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
     self._validate_model_class()
     tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
     assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
     assistant_input_ids = kwargs.pop("assistant_input_ids", None)  # only used for assisted generation
     speculative_margin = kwargs.pop("speculative_margin", 1)
+    spec_alpha = kwargs.pop("spec_alpha", 0.1)
+    assistant_past_key_values = kwargs.pop("assistant_past_key_values", None)
+    output_latency = kwargs.pop("output_latency", False)
+
     generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
     self._validate_model_kwargs(model_kwargs.copy())
     self._validate_assistant(assistant_model)
@@ -463,7 +467,7 @@ def generate(
         )
 
         # 12. run assisted generate
-        result, accepted_tokens = self._assisted_decoding(
+        result = self._assisted_decoding(
             input_ids,
             assistant_input_ids,
             candidate_generator=candidate_generator,
@@ -473,8 +477,12 @@ def generate(
             synced_gpus=synced_gpus,
             streamer=streamer,
             speculative_margin=speculative_margin,
+            spec_alpha=spec_alpha,
+            assistant_past_key_values=assistant_past_key_values,
             **model_kwargs,
         )
+        if output_latency:
+            result, latency = result
     elif generation_mode == GenerationMode.DOLA_GENERATION:
         if self._is_stateful:
             # DoLa decoding was not designed for stateful models, and would require some changes
@@ -690,7 +698,13 @@ def generate(
             should_convert_cache = True
         if should_convert_cache:
             result.past_key_values = result.past_key_values.to_legacy_cache()
-    return result, accepted_tokens
+    if output_latency:
+        return result, latency 
+    
+    return result
+
+
+
 
 
 
@@ -707,6 +721,8 @@ def _assisted_decoding(
     generation_config: GenerationConfig,
     synced_gpus: bool,
     speculative_margin: float,
+    spec_alpha: float,
+    assistant_past_key_values: Optional[Dict[str, torch.Tensor]],
     streamer: Optional["BaseStreamer"],
     **model_kwargs,
 ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
@@ -747,7 +763,7 @@ def _assisted_decoding(
         `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
         `model.config.is_encoder_decoder=True`.
     """
-    print("***********Using Cuton assistant decoding**********")
+    # print("***********Using Cuton assistant decoding**********")
     # init values
     do_sample = generation_config.do_sample
     output_attentions = generation_config.output_attentions
@@ -775,14 +791,34 @@ def _assisted_decoding(
     unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
     model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
     accepted_tokens = 0
+    candidates_tokens = 0
     this_peer_finished = False
     is_first_iteration = True  # to preserve the same API in the output as other generation methods
+    import time
+    decoding_start_time = time.time()
+    prefill_time = 0
     while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         cur_len = input_ids.shape[-1]
-        import time
         start_time = time.time()
-        candidate_input_ids, candidate_logits = candidate_generator.get_candidates(input_ids, assistant_input_ids)
-        end_time = time.time()
+
+        if is_first_iteration:
+            # past_key_values, past_key_values_assistant = prefill_first_iteration(
+            #     self,
+            #     candidate_generator.assistant_model,
+            #     input_ids[:, :-1], 
+            #     assistant_input_ids, 
+            #     candidate_generator
+            # )
+            candidate_generator.assistant_kwargs["past_key_values"] = assistant_past_key_values
+            # model_kwargs["past_key_values"] = past_key_values
+            # model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+
+        # end_time = time.time()
+        # gap1 = end_time - start_time
+        # if prefill_time == 0:
+        #     prefill_time = gap1
+        # start_time = time.time()
+        candidate_input_ids, candidate_logits = candidate_generator.get_candidates(input_ids, assistant_input_ids, is_first_iteration)
         #  1. Fetch candidate sequences from a `CandidateGenerator`
         # Mark: Modify Here
         
@@ -791,7 +827,8 @@ def _assisted_decoding(
             candidate_logits = candidate_logits.to(self.device)
 
         candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
-        print(f"Candidate Length: {candidate_length}, Time: {end_time - start_time}")
+        candidates_tokens += candidate_length
+        # print(f"Candidate Length: {candidate_length}")
         # print()
         is_done_candidate = stopping_criteria(candidate_input_ids, None)
 
@@ -825,10 +862,11 @@ def _assisted_decoding(
         start_time = time.time()
         outputs = self(**model_inputs)
         end_time = time.time()
-        print(f"Target Model Forward Time: {end_time - start_time}")
+        # print(f"Target Model Forward Time: {end_time - start_time}")
 
         # 2.3. Process the new logits
         # .float() is needed to retain precision for later logits manipulations
+        
         new_logits = outputs.logits[:, -candidate_length - 1 :].float()  # excludes the input prompt if present
         new_logits = new_logits.to(input_ids.device)
         next_token_logits = new_logits.clone()
@@ -840,7 +878,8 @@ def _assisted_decoding(
         # Case 1: `do_sample=True` and we have logits for the candidates (originally from speculative decoding)
         # 👉 Apply algorithm 1 from the speculative decoding paper (https://arxiv.org/pdf/2211.17192.pdf).
         if candidate_logits is not None: 
-            print("Start Speculative Sampling")
+            # print("Start Speculative Sampling")
+            # temperature = generation_config.get("temperature", 1)
             valid_tokens, n_matches = _speculative_sampling(
                 candidate_input_ids,
                 candidate_logits,
@@ -848,6 +887,8 @@ def _assisted_decoding(
                 new_logits,
                 is_done_candidate,
                 m=speculative_margin,
+                alpha=spec_alpha,
+                # temperature=generation_config.temperature
             )
         # Case 2: all other cases (originally from assisted generation) 👉 Compare the tokens selected from the
         # original model logits with the candidate tokens. We can keep the candidate tokens until the first
@@ -866,7 +907,7 @@ def _assisted_decoding(
             if is_done_candidate and n_matches == candidate_length:
                 n_matches -= 1
             valid_tokens = selected_tokens[:, : n_matches + 1]
-        print("Current iteration matches: ", n_matches)
+        # print("Current iteration matches: ", n_matches)
         accepted_tokens += n_matches
         # 4. Update variables according to the number of matching assistant tokens. Remember: the token generated
         # by the model after the last candidate match is also valid, as it is generated from a correct sequence.
@@ -975,17 +1016,25 @@ def _assisted_decoding(
                 past_key_values=model_kwargs.get("past_key_values"),
             )
     else:
-        return input_ids, accepted_tokens
+        decoding_end_time = time.time()
+        return_dict = {
+            "accept_tokens": accepted_tokens,
+            "decoding_time": decoding_end_time - decoding_start_time,
+            "candidates_tokens": candidates_tokens
+        }
+        return input_ids, return_dict
 
 
 
 def _speculative_sampling(
-    candidate_input_ids,
-    candidate_logits,
-    candidate_length,
-    new_logits,
-    is_done_candidate,
-    m=1,
+        candidate_input_ids,
+        candidate_logits,
+        candidate_length,
+        new_logits,
+        is_done_candidate,
+        m=0,
+        alpha=0.1,
+        # temperature=1
     ):
     """
     Applies sampling as in the speculative decoding paper (https://arxiv.org/pdf/2211.17192.pdf, algorithm 1). Returns
@@ -1000,24 +1049,73 @@ def _speculative_sampling(
     q_i = q[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
     p = new_logits.softmax(dim=-1)
     p_i = p[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
-    probability_ratio = p_i / q_i
+    
+    # adjust_logits = new_logits[:, torch.arange(candidate_length), :] - m * new_logits[:, torch.arange(candidate_length), :] + m * candidate_logits[:, torch.arange(candidate_length), :]
+    # adjust_p = adjust_logits.softmax(dim=-1)
+    # adjust_p_i = adjust_p[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
+    
+    # imp cd
+    # expert_logits = candidate_logits[:, torch.arange(candidate_length), :]
+    student_logits = new_logits[:, torch.arange(candidate_length), :]
+    teacher_logits = candidate_logits[:, torch.arange(candidate_length), :]
+    teacher_prob = (teacher_logits).softmax(dim=-1)
+    student_prob = (student_logits).softmax(dim=-1)
+    gradient = student_prob - teacher_prob
+    # print("Sum of logits,", student_logits.sum())
 
+    threshold = alpha * teacher_prob.max(dim=-1, keepdim=True)[0]
+    mask = teacher_prob >= threshold
+
+    truncate_g = torch.where(mask, gradient, torch.full_like(gradient, 0.0))
+    
+
+
+    adjust_logits = student_logits - m * truncate_g
+
+    # threshold = expert_logits.max(dim=-1, keepdim=True)[0] + np.log(alpha)
+    # mask = expert_logits >= threshold
+    # contrastive_diff = m * (expert_logits - amateur_logits)
+    # contrastive_logits = torch.where(mask, contrastive_diff, torch.full_like(contrastive_diff, 0.0))
+    
+    # adjust_logits = new_logits[:, torch.arange(candidate_length), :] + contrastive_logits
+    adjust_p = adjust_logits.softmax(dim=-1)
+    adjust_p_i = adjust_p[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
+    
+    # naive cd
+
+    # threshold = 0.1 * q.max(dim=-1, keepdim=True)[0]
+    # mask = q >= threshold
+    # contrastive_diff = m * (q.log() - p.log())
+    # contrastive_logits = torch.where(mask, contrastive_diff, torch.full_like(contrastive_diff, 0.0))
+    
+    # adjust_p = adjust_logits.softmax(dim=-1)
+    # adjust_p_i = adjust_p[:, torch.arange(candidate_length), new_candidate_input_ids].squeeze(0, 1)
+    
+
+
+    probability_ratio = adjust_p_i / q_i
+    # probability_ratio = torch.exp(p_i - q_i)
+    # assert not torch.isnan(probability_ratio).any(), "NaN values in probabilities"
+    # assert not torch.isinf(probability_ratio).any(), "Infinite values in probabilities"
+    # assert not torch.isinf(-probability_ratio).any(), "Infinite values in probabilities"
+    # print(probability_ratio)
+    # print("M=", m)
+    # print("Alpha=", alpha)
+    # probability_ratio = probability_ratio + (1 - probability_ratio) * m * q_i / p_i
     # # When probability_ratio > 1 (i.e. q_i(x) < p_i(x), or "assistant probability of the candidate token is smaller
     # # than the model probability for the same token"), keep the token. Otherwise reject with p = 1 - probability_ratio
     # # (= keep with p = probability_ratio). Keep all the tokens until the first rejection
     r_i = torch.rand_like(probability_ratio)
-    is_accepted = r_i <= probability_ratio
-
-    # dual rejection sampling
+    is_accepted = r_i <= probability_ratio 
     # is_accepted_lc = r_i <= probability_ratio 
-    # # n_matches_naive = ((~is_accepted).cumsum(dim=-1) < 1).sum()  # this is `n` in algorithm 1
-    # print("M=", m)
-    # rag_probability_ratio = q_i / (m*p_i)
+    # n_matches_naive = ((~is_accepted).cumsum(dim=-1) < 1).sum()  # this is `n` in algorithm 1
+    
+    
+    # rag_probability_ratio = m * q_i / p_i
     # r_i_rag = torch.rand_like(rag_probability_ratio)
     # is_accepted_rag = r_i_rag <= rag_probability_ratio
     # is_accepted = torch.logical_or(is_accepted_lc, is_accepted_rag)
     
-
 
 
     # log_q_i = q_i.log()
@@ -1085,11 +1183,22 @@ def _speculative_sampling(
         gamma = candidate_logits.shape[1]
         p_n_plus_1 = p[:, n_matches, :]
         if n_matches < gamma:
+            adjust_p_n_plus_1 = adjust_p[:, n_matches, :]
             q_n_plus_1 = q[:, n_matches, :]
-            p_prime = torch.clamp((p_n_plus_1 - q_n_plus_1), min=0)
+            # p_prime = torch.clamp((adjust_p_n_plus_1 - q_n_plus_1), min=0)
+            p_prime = torch.clamp(torch.maximum(p_n_plus_1 - q_n_plus_1, p_n_plus_1 - adjust_p_n_plus_1), min=0)
+            # p_prime = torch.clamp((p_n_plus_1 - q_n_plus_1), min=0) - torch.clamp(m * q_n_plus_1 / p_n_plus_1 * (q_n_plus_1 - p_n_plus_1), min=0)
+            # print("p zero", torch.eq(p_n_plus_1, 0).any().item())
+            # print("q zero", torch.eq(q_n_plus_1, 0).any().item())
+            # print("p:", p_n_plus_1)
+            # print("q:", q_n_plus_1)
+            print("q_item", p_prime)
             p_prime.div_(p_prime.sum())
         else:
             p_prime = p_n_plus_1
+            # p_prime = p[:, n_matches, :]
+            # p_prime
+        # print(p_prime)
         t = torch.multinomial(p_prime, num_samples=1).squeeze(1)[None, :]
 
         # The selected tokens include the matches (if any) plus the next sampled tokens
@@ -1099,46 +1208,3 @@ def _speculative_sampling(
             valid_tokens = t
 
     return valid_tokens, n_matches
-
-
-
-
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import time
-import torch
-
-
-
-
-
-def get_max_gpu_memory():
-    if torch.cuda.is_available():
-        device = torch.cuda.current_device()
-        gpu_properties = torch.cuda.get_device_properties(device)
-        return gpu_properties.total_memory
-    else:
-        return None
-
-def load_model(
-    model_name: str = "../../../yarn-mistral-7b-128k",
-    device_list="0"
-):
-    print("Loading tokenizer")
-    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    # tok.pad_token = tok.eos_token
-    print("Loading model")
-    start_time = time.time()
-
-    max_gpu_memory = get_max_gpu_memory() / (1024 ** 3)
-    device_list = [int(x) for x in device_list.split(",")]
-    max_memory = {i: f"{max_gpu_memory}GiB" for i in device_list}
-    llm =  AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        torch_dtype=torch.bfloat16, 
-        use_flash_attention_2=True, 
-        device_map="auto",
-        max_memory=max_memory,
-        trust_remote_code=True)
-    # llm = LLM(model=model_name, trust_remote_code=True, gpu_memory_utilization=0.95)#, tensor_parallel_size=ngpu)
-    print("Time taken:", round(time.time() - start_time))
-    return llm, tok  # type: ignore

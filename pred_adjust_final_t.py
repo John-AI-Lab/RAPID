@@ -12,8 +12,8 @@ import torch.multiprocessing as mp
 import sys
 sys.path.append("/mnt/workspace/Projects/LongSpec/")
 sys.path.append("/mnt/workspace/Projects/LongSpec/LongBench")
-from src_adjust_final_t.rag import get_input_prompts, get_rag_context
-from src_adjust_final_t.model_wrap import LongSpecEngine
+from src.rag import get_input_prompts, get_rag_context
+from src.model_wrap import LongSpecEngine
 import torch
 
 

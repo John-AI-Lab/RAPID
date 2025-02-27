@@ -190,8 +190,6 @@ class LongSpecEngine:
                 latency['accept_tokens'] = latency['accept_tokens'].item()
                 latency['candidates_tokens'] = latency['candidates_tokens']
             else:
-                if rag_only:
-                    input_ids = assistant_input_ids
                 prefill_outputs = self.get_prefill_outputs(self.model, input_ids[:, :-1])
                 prefill_time = time.time() - prefill_start_time
                 past_key_values = prefill_outputs.past_key_values
@@ -202,24 +200,12 @@ class LongSpecEngine:
                     past_key_values=past_key_values,
                     output_latency=False,
                     **generation_kwargs
-                    # max_new_tokens=100,
-                    # do_sample=False, 
-                    # top_p=1, 
-                    # top_k=-1, 
-                    # temperature=1,
-                    # speculative_margin=speculative_margin
                 )
                 latency = {
                     "prefill_time": prefill_time,
                     "decoding_time": time.time() - decoding_start_time
                 }
-                # print(outputs.shape)
-                
-                # accepted_tokens: number of tokens accepted by the model
-                # judge if accepted tokens is a tensor
-                # if isinstance(accepted_tokens, torch.Tensor):
-                #     accepted_tokens = accepted_tokens.item()
-            # print(outputs)
+
             num_tokens_generated = outputs.shape[1] - input_ids.shape[1]
             tokens_per_second = num_tokens_generated / latency['decoding_time']
             latency['num_tokens_generated'] = num_tokens_generated
