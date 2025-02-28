@@ -1,6 +1,6 @@
 # RAPID: Long-Context Inference with Retrieval-Augmented Speculative Decoding
 
-This repo provides the official implementation of our paper "Long-Context Inference with Retrieval-Augmented Speculative Decoding".
+This repo provides the official implementation of our paper "Long-Context Inference with Retrieval-Augmented Speculative Decoding". (In the process of refactoring code and illustrations.)
 
 
 
