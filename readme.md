@@ -123,7 +123,7 @@ print(responses)
 
 ### LongBench V2
 
-- Evaluate with temperature=0.1 following official settings. To avoid the [randomness issue](https://github.com/THUDM/LongBench/issues/94) when evaluating with vllm in official repo, we provide an evaluation script based on transformers generate.
+- Evaluate with temperature=0.1 following official settings. To avoid the [randomness issue](https://github.com/THUDM/LongBench/issues/94) when evaluating with vllm in official repo, we provide an [evaluation script](eval/pred_longbench.py) based on transformers generate.
 
  
 
