@@ -96,6 +96,8 @@ GenerateDecoderOnlyOutput,
 _split_model_outputs
 
 )
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import time
 
 
 if TYPE_CHECKING:
@@ -160,6 +162,46 @@ def _get_candidate_generator(
             logits_processor=logits_processor,
         )
     return candidate_generator
+
+
+
+
+
+def get_max_gpu_memory():
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        gpu_properties = torch.cuda.get_device_properties(device)
+        return gpu_properties.total_memory
+    else:
+        return None
+
+def load_model_tokenizer(
+    model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
+    device_list="0"
+):
+    print("Loading tokenizer")
+    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    # tok.pad_token = tok.eos_token
+    print("Loading model")
+    start_time = time.time()
+
+    max_gpu_memory = get_max_gpu_memory() / (1024 ** 3)
+    device_list = [int(x) for x in device_list.split(",")]
+    max_memory = {i: f"{max_gpu_memory}GiB" for i in device_list}
+    # if len(device_list) == 4:
+    #     max_memory[3] = "76GiB"
+    model =  AutoModelForCausalLM.from_pretrained(
+        model_name, 
+        torch_dtype=torch.bfloat16, 
+        use_flash_attention_2=True, 
+        device_map="auto",
+        max_memory=max_memory,
+        trust_remote_code=True)
+    # llm = LLM(model=model_name, trust_remote_code=True, gpu_memory_utilization=0.95)#, tensor_parallel_size=ngpu)
+    print("Time taken:", round(time.time() - start_time))
+    return model, tok  # type: ignore
+
+
 
 
 
@@ -479,6 +521,7 @@ def generate(
             speculative_margin=speculative_margin,
             spec_alpha=spec_alpha,
             assistant_past_key_values=assistant_past_key_values,
+            output_latency=output_latency,
             **model_kwargs,
         )
         if output_latency:
@@ -724,6 +767,7 @@ def _assisted_decoding(
     spec_alpha: float,
     assistant_past_key_values: Optional[Dict[str, torch.Tensor]],
     streamer: Optional["BaseStreamer"],
+    output_latency: bool,
     **model_kwargs,
 ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
     r"""
@@ -1022,7 +1066,9 @@ def _assisted_decoding(
             "decoding_time": decoding_end_time - decoding_start_time,
             "candidates_tokens": candidates_tokens
         }
-        return input_ids, return_dict
+        if output_latency:
+            return input_ids, return_dict
+        return input_ids
 
 
 

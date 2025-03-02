@@ -1,48 +1,9 @@
-CONTEXT_STRUCTURE = '''<Retrieved Context>
-{rag_context}
-</Retrieved Context>
-
-<Full Long Context>
-{long_context}
-</Full Long Context>
-
-{query}
-'''
-
-RAG_PROMPT_TEMPLATE = '''<Retrieved Context>
-{rag_context}
-</Retrieved Context>'''
-
-# RAG_PROMPT_TEMPLATE_WITH_FULL = '''<Retrieved Context>
-# {rag_context}
-# </Retrieved Context>
-
-# <Full Long Context>
-# {long_context}
-# </Full Long Context>'''
-
-
-LONG_CONTEXT_PROMPT_TEMPLATE = '''<Context>
-{long_context}
-</Context>'''
-
-
-RAG_INSTRUCTION = '''Please answer the question based on the <Retrieved Context> provided above. \
-If the context doesn't contain all necessary information, please make reasonable inferences based on the available information.'''
-
-FULL_INSTRUCTION = '''Please answer the question based on the <Context> provided above.'''
-
-
-# FULL_INSTRUCTION_WITH_RAG = '''Given the provided contexts above:
-# 1. The <Retrieved Context> contains relevant excerpts selected from the full text specifically related to the question.
-# 2. The <Full Long Context> contains the complete original full text.
-
-# Please use both contexts to provide a precise answer:
-# - First, focus on the key information from the retrieved context if it can directly address the question.
-# - If the <Retrieved Context> is insufficient, supplement or validate this information using the full context.
-# - Ensure your answer is accurate by cross-referencing both contexts.
-# - If you notice any important details in the full context that were not included in the retrieved portions but are relevant to the question, please utilize them to solve the question.'''
-
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import faiss
+from rank_bm25 import BM25Okapi
+from langchain_community.retrievers import BM25Retriever
+from nltk.tokenize import word_tokenize
+from sentence_transformers import SentenceTransformer
 
 
 
@@ -59,7 +20,6 @@ def split_into_chunks(document, tokenizer, max_tokens=128):
     Returns:
     - chunks: list of str, each being a chunk of text that respects the token limit.
     """
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
     
     # Initialize Langchain's RecursiveCharacterTextSplitter
     text_splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
@@ -93,10 +53,8 @@ def split_into_chunks(document, tokenizer, max_tokens=128):
     
     return chunks_with_positions
     
-    # return initial_chunks
 
 
-import faiss
 def retrieve_short_context(embed_model, tokenizer, chunks_with_positions, query, top_k=5, rag_threshold=0.3):
     # Split context into chunks
     chunks_text = [chunk['text'] for chunk in chunks_with_positions]
@@ -130,9 +88,6 @@ def retrieve_short_context(embed_model, tokenizer, chunks_with_positions, query,
     return filtered_results
 
 
-from rank_bm25 import BM25Okapi
-from langchain_community.retrievers import BM25Retriever
-from nltk.tokenize import word_tokenize
 
 
 def retrieve_short_context_bm25(tokenizer, chunks_with_positions, query, top_k=5):
@@ -149,7 +104,7 @@ def retrieve_short_context_bm25(tokenizer, chunks_with_positions, query, top_k=5
     return retrieved_chunks
 
 
-from sentence_transformers import SentenceTransformer
+
 def get_rag_context(long_context, query, embed_model_path, tokenizer, num_to_retrieve, max_chunk_token=128, rag_threshold=0.1):
     '''
     Parameters:
@@ -164,7 +119,6 @@ def get_rag_context(long_context, query, embed_model_path, tokenizer, num_to_ret
     embed_model = SentenceTransformer(embed_model_path)
     model_retrieved_chunks = retrieve_short_context(embed_model, tokenizer, chunks, query, top_k=num_to_retrieve, rag_threshold=rag_threshold)
     # bm25_retrieval_chunks = retrieve_short_context_bm25(tokenizer, chunks, query, top_k=5)
-    # print("bm25_retrieval_chunks: ", len(bm25_retrieval_chunks))
     all_chunks = model_retrieved_chunks
     unique_chunks = {chunk['position']: chunk for chunk in all_chunks}.values()
     
@@ -176,24 +130,3 @@ def get_rag_context(long_context, query, embed_model_path, tokenizer, num_to_ret
     return retrieved_context, len(sorted_chunks)
 
 
-
-def get_input_prompts(
-        long_context: str,
-        query: str,
-        embed_model_path: str,
-        num_chunks_to_retrieve: int,
-        max_chunk_len: int,
-        tokenizer,
-        global_instruction: str = None,
-        rag_threshold: float = 0.3):
-    if global_instruction:
-        global_instruction = "\n" + global_instruction
-    retrieved_context = get_rag_context(long_context, query, embed_model_path, tokenizer, num_chunks_to_retrieve, max_chunk_len, rag_threshold)
-    rag_prompt = RAG_PROMPT_TEMPLATE.format(rag_context=retrieved_context)
-    # rag_prompt_with_full = RAG_PROMPT_TEMPLATE_WITH_FULL.format(rag_context=retrieved_context, long_context=long_context)
-    full_context = LONG_CONTEXT_PROMPT_TEMPLATE.format(long_context=long_context)
-    full_input = full_context + "\n" + query + "\n" + FULL_INSTRUCTION + global_instruction
-
-    # full_input = rag_prompt_with_full + "\n" + query + "\n" + FULL_INSTRUCTION + global_instruction
-    rag_input = rag_prompt + "\n" + query + "\n" + RAG_INSTRUCTION + global_instruction
-    return rag_input, full_input

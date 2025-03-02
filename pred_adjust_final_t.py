@@ -70,7 +70,7 @@ def get_max_gpu_memory():
         return None
 
 def load_model(
-    model_name: str = "../../../yarn-mistral-7b-128k",
+    model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
     device_list="0"
 ):
     print("Loading tokenizer")
